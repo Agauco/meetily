@@ -10,6 +10,10 @@ import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
 import { useMemo } from 'react';
+import type { SpeakerActions } from '@/hooks/useMeetingSpeakers';
+import {
+  assignLiveSegments, buildLiveSpeakers, createAndAssignLive, mergeLiveSpeakers, renameLiveSpeaker,
+} from '@/lib/liveSpeakers';
 
 /**
  * TranscriptPanel Component
@@ -31,13 +35,16 @@ export function TranscriptPanel({
   showModal
 }: TranscriptPanelProps) {
   // Contexts
-  const { transcripts, transcriptContainerRef, copyTranscript } = useTranscripts();
+  const { transcripts, transcriptContainerRef, copyTranscript, updateTranscripts } = useTranscripts();
   const { transcriptModelConfig } = useConfig();
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
 
   // Convert transcripts to segments for virtualized view
+  const { speakers, segmentSpeakers } = useMemo(() => buildLiveSpeakers(transcripts), [transcripts]);
+  const hasSpeakers = speakers.length > 0;
+
   const segments = useMemo(() =>
     transcripts.map(t => ({
       id: t.id,
@@ -45,9 +52,19 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      speaker: segmentSpeakers[t.id],
     })),
-    [transcripts]
+    [transcripts, segmentSpeakers]
   );
+
+  // Live speaker edits are kept on the transcripts and saved together with the meeting
+  const speakerActions = useMemo<SpeakerActions>(() => ({
+    rename: async (speakerId, name) => updateTranscripts(prev => renameLiveSpeaker(prev, speakerId, name)),
+    assign: async (ids, speakerId) => updateTranscripts(prev => assignLiveSegments(prev, ids, speakerId)),
+    createAndAssign: async (ids, name) => updateTranscripts(prev => createAndAssignLive(prev, ids, name)),
+    merge: async (fromId, intoId) => updateTranscripts(prev => mergeLiveSpeakers(prev, fromId, intoId)),
+    assignRoom: async (ids) => updateTranscripts(prev => assignLiveSegments(prev, ids, 'room')),
+  }), [updateTranscripts]);
 
   return (
     <div ref={transcriptContainerRef} className="w-full border-r border-gray-200 bg-white flex flex-col overflow-y-auto">
@@ -113,6 +130,8 @@ export function TranscriptPanel({
               isStopping={isStopping}
               enableStreaming={isRecording}
               showConfidence={true}
+              speakers={hasSpeakers ? speakers : undefined}
+              speakerActions={hasSpeakers ? speakerActions : undefined}
             />
           </div>
         </div>

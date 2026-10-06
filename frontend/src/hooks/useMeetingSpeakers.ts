@@ -11,6 +11,8 @@ export interface SpeakerActions {
   /** Creates a new speaker (optionally named) and assigns it to the segments. */
   createAndAssign: (transcriptIds: string[], name?: string) => Promise<void>;
   merge: (fromSpeakerId: string, intoSpeakerId: string) => Promise<void>;
+  /** Assigns segments to the reserved "Sala" speaker (several people / unidentifiable). */
+  assignRoom: (transcriptIds: string[]) => Promise<void>;
 }
 
 export interface UseMeetingSpeakersReturn {
@@ -88,6 +90,12 @@ export function useMeetingSpeakers(meetingId?: string | null, enabled: boolean =
         if (!meetingId || transcriptIds.length === 0) return;
         const speaker = await invoke<{ id: string }>('api_create_speaker', { meetingId, name: name ?? null });
         await invoke('api_assign_segment_speaker', { meetingId, transcriptIds, speakerId: speaker.id });
+        await refresh();
+      },
+      assignRoom: async (transcriptIds) => {
+        if (!meetingId || transcriptIds.length === 0) return;
+        const room = await invoke<{ id: string }>('api_get_room_speaker', { meetingId });
+        await invoke('api_assign_segment_speaker', { meetingId, transcriptIds, speakerId: room.id });
         await refresh();
       },
       merge: async (fromSpeakerId, intoSpeakerId) => {

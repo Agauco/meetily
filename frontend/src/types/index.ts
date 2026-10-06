@@ -22,6 +22,10 @@ export interface Transcript {
   speaker_index?: number | null; // Meeting-local person index (0-based)
   speaker_is_room?: boolean;     // Overlap / unidentifiable speech ("Sala")
   speaker_confidence?: number | null;
+  speaker_name?: string;            // name the user gave the live speaker
+  manual_speaker_index?: number;    // manual correction made during the recording
+  manual_speaker_is_room?: boolean;
+  manual_speaker_name?: string;
 }
 
 export interface TranscriptUpdate {

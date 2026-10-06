@@ -735,6 +735,7 @@ pub fn run() {
             api::speakers::api_list_speakers,
             api::speakers::api_list_segment_speakers,
             api::speakers::api_create_speaker,
+            api::speakers::api_get_room_speaker,
             api::speakers::api_rename_speaker,
             api::speakers::api_assign_segment_speaker,
             api::speakers::api_merge_speakers,

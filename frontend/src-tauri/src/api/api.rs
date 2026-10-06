@@ -197,6 +197,16 @@ pub struct TranscriptSegment {
     pub speaker_is_room: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_confidence: Option<f64>,
+    /// Name the user gave the live speaker (applies to the whole meeting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_name: Option<String>,
+    /// Manual correction made during the recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_speaker_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual_speaker_is_room: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_speaker_name: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
