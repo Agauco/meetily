@@ -1,3 +1,5 @@
+import type { SegmentSpeakerInfo } from './speakers';
+
 export interface Message {
   id: string;
   content: string;
@@ -141,4 +143,6 @@ export interface TranscriptSegmentData {
   endTime?: number; // audio_end_time in seconds
   text: string;
   confidence?: number;
+  /** Voice-based speaker of this segment (speaker diarization), when known. */
+  speaker?: SegmentSpeakerInfo;
 }
