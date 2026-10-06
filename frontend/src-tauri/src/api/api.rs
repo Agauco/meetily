@@ -176,7 +176,7 @@ pub struct SaveTranscriptRequest {
     pub transcripts: Vec<TranscriptSegment>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct TranscriptSegment {
     pub id: String,
     pub text: String,
@@ -188,6 +188,19 @@ pub struct TranscriptSegment {
     pub audio_end_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    // Live speaker diarization (all optional; absent when diarization is off)
+    /// Zero-based index of the live-detected speaker within this recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_index: Option<i64>,
+    /// True when the fragment was classified as "Sala" (overlap / unidentifiable).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speaker_is_room: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_confidence: Option<f64>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Serialize, Deserialize)]

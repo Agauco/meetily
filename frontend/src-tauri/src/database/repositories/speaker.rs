@@ -18,6 +18,12 @@ const SPEAKER_COLORS: [&str; 10] = [
     "#6366F1", "#84CC16",
 ];
 
+/// Label and color of the reserved "room" speaker (overlapping / unidentifiable speech).
+pub const ROOM_LABEL: &str = "Sala";
+pub const ROOM_COLOR: &str = "#6B7280";
+pub const KIND_PERSON: &str = "person";
+pub const KIND_ROOM: &str = "room";
+
 /// Maximum depth followed when resolving `merged_into` chains (guards against corrupt data).
 const MAX_MERGE_DEPTH: usize = 32;
 
@@ -30,6 +36,8 @@ pub struct Speaker {
     pub color: Option<String>,
     pub created_at: String,
     pub merged_into: Option<String>,
+    /// "person" or "room"
+    pub kind: String,
 }
 
 /// Speaker with per-meeting statistics (active speakers only).
@@ -41,6 +49,8 @@ pub struct SpeakerSummary {
     /// `name` when set, otherwise `label`.
     pub display_name: String,
     pub color: Option<String>,
+    /// "person" or "room"
+    pub kind: String,
     pub utterance_count: i64,
     pub total_duration: f64,
 }
@@ -81,6 +91,90 @@ pub enum SpeakerError {
     EditNotUndoable(String),
     #[error("segment {0} was changed after this edit; cannot undo")]
     UndoConflict(String),
+    #[error("the room speaker cannot be renamed or merged")]
+    RoomSpeaker,
+}
+
+/// Voice-based result for one saved transcript segment, as produced live by the diarization engine.
+#[derive(Debug, Clone)]
+pub struct AutoSpeakerInput {
+    pub transcript_id: String,
+    /// Meeting-local person index (0-based); `None` when the segment is unassigned or room.
+    pub speaker_index: Option<usize>,
+    /// True for overlapping / unidentifiable speech ("Sala").
+    pub is_room: bool,
+    pub confidence: Option<f64>,
+}
+
+async fn ensure_room_speaker(conn: &mut sqlx::SqliteConnection, meeting_id: &str) -> Result<String, sqlx::Error> {
+    if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM speakers WHERE meeting_id = ? AND kind = 'room' LIMIT 1")
+        .bind(meeting_id)
+        .fetch_optional(&mut *conn)
+        .await?
+    {
+        return Ok(id);
+    }
+    let id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO speakers (id, meeting_id, label, color, created_at, kind) VALUES (?, ?, ?, ?, ?, 'room')")
+        .bind(&id)
+        .bind(meeting_id)
+        .bind(ROOM_LABEL)
+        .bind(ROOM_COLOR)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *conn)
+        .await?;
+    Ok(id)
+}
+
+/// Creates the speakers referenced by `inputs` (one per distinct person index, plus the room speaker when
+/// needed) and stores them as the *automatic* speaker of the given transcript segments.
+/// Meant to run inside the transaction that saves a recorded meeting. Manual overrides are never touched.
+pub async fn persist_auto_speakers(
+    conn: &mut sqlx::SqliteConnection,
+    meeting_id: &str,
+    inputs: &[AutoSpeakerInput],
+) -> Result<(), sqlx::Error> {
+    let mut indices: Vec<usize> = inputs.iter().filter(|i| !i.is_room).filter_map(|i| i.speaker_index).collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut ids: HashMap<usize, String> = HashMap::new();
+    for index in indices {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO speakers (id, meeting_id, label, color, created_at, kind) VALUES (?, ?, ?, ?, ?, 'person')")
+            .bind(&id)
+            .bind(meeting_id)
+            .bind(format!("Mówca {}", index + 1))
+            .bind(SPEAKER_COLORS[index % SPEAKER_COLORS.len()])
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *conn)
+            .await?;
+        ids.insert(index, id);
+    }
+    let room_id = if inputs.iter().any(|i| i.is_room) {
+        Some(ensure_room_speaker(&mut *conn, meeting_id).await?)
+    } else {
+        None
+    };
+
+    for input in inputs {
+        let speaker_id = if input.is_room {
+            room_id.clone()
+        } else {
+            input.speaker_index.and_then(|i| ids.get(&i).cloned())
+        };
+        if speaker_id.is_none() {
+            continue;
+        }
+        sqlx::query("UPDATE transcripts SET auto_speaker_id = ?, speaker_confidence = ? WHERE id = ? AND meeting_id = ?")
+            .bind(speaker_id)
+            .bind(input.confidence)
+            .bind(&input.transcript_id)
+            .bind(meeting_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
 }
 
 pub struct SpeakersRepository;
@@ -112,7 +206,7 @@ impl SpeakersRepository {
 
     async fn get_speaker(pool: &SqlitePool, speaker_id: &str) -> Result<Speaker, SpeakerError> {
         sqlx::query_as::<_, Speaker>(
-            "SELECT id, meeting_id, label, name, color, created_at, merged_into FROM speakers WHERE id = ?",
+            "SELECT id, meeting_id, label, name, color, created_at, merged_into, kind FROM speakers WHERE id = ?",
         )
         .bind(speaker_id)
         .fetch_optional(pool)
@@ -127,7 +221,7 @@ impl SpeakersRepository {
         name: Option<&str>,
         centroid: Option<&[f32]>,
     ) -> Result<Speaker, SpeakerError> {
-        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE meeting_id = ?")
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE meeting_id = ? AND kind = 'person'")
             .bind(meeting_id)
             .fetch_one(pool)
             .await?;
@@ -140,6 +234,7 @@ impl SpeakersRepository {
             color: Some(SPEAKER_COLORS[(n - 1) % SPEAKER_COLORS.len()].to_string()),
             created_at: Utc::now().to_rfc3339(),
             merged_into: None,
+            kind: KIND_PERSON.to_string(),
         };
         let centroid_bytes: Option<Vec<u8>> =
             centroid.map(|c| c.iter().flat_map(|v| v.to_le_bytes()).collect());
@@ -165,7 +260,7 @@ impl SpeakersRepository {
         meeting_id: &str,
     ) -> Result<Vec<SpeakerSummary>, SpeakerError> {
         let speakers: Vec<Speaker> = sqlx::query_as(
-            "SELECT id, meeting_id, label, name, color, created_at, merged_into FROM speakers WHERE meeting_id = ? ORDER BY created_at, id",
+            "SELECT id, meeting_id, label, name, color, created_at, merged_into, kind FROM speakers WHERE meeting_id = ? ORDER BY created_at, id",
         )
         .bind(meeting_id)
         .fetch_all(pool)
@@ -203,6 +298,7 @@ impl SpeakersRepository {
                     label: s.label,
                     name: s.name,
                     color: s.color,
+                    kind: s.kind,
                     utterance_count: count,
                     total_duration: total,
                 }
@@ -218,6 +314,9 @@ impl SpeakersRepository {
         name: Option<&str>,
     ) -> Result<(), SpeakerError> {
         let name = name.map(str::trim).filter(|s| !s.is_empty());
+        if Self::get_speaker(pool, speaker_id).await?.kind == KIND_ROOM {
+            return Err(SpeakerError::RoomSpeaker);
+        }
         let res = sqlx::query("UPDATE speakers SET name = ? WHERE id = ?")
             .bind(name)
             .bind(speaker_id)
@@ -240,6 +339,9 @@ impl SpeakersRepository {
         let into = Self::get_speaker(pool, into_id).await?;
         if from.meeting_id != into.meeting_id {
             return Err(SpeakerError::WrongMeeting(into_id.to_string()));
+        }
+        if from.kind == KIND_ROOM || into.kind == KIND_ROOM {
+            return Err(SpeakerError::RoomSpeaker);
         }
         let links = Self::merge_links(pool, &from.meeting_id).await?;
         let from_root = resolve_root(&links, from_id);
@@ -345,7 +447,7 @@ impl SpeakersRepository {
         meeting_id: &str,
     ) -> Result<Vec<SegmentSpeaker>, SpeakerError> {
         let speakers: Vec<Speaker> = sqlx::query_as(
-            "SELECT id, meeting_id, label, name, color, created_at, merged_into FROM speakers WHERE meeting_id = ?",
+            "SELECT id, meeting_id, label, name, color, created_at, merged_into, kind FROM speakers WHERE meeting_id = ?",
         )
         .bind(meeting_id)
         .fetch_all(pool)
@@ -380,6 +482,14 @@ impl SpeakersRepository {
                 }
             })
             .collect())
+    }
+
+    /// Returns the meeting's reserved "Sala" speaker, creating it when missing.
+    pub async fn get_or_create_room_speaker(pool: &SqlitePool, meeting_id: &str) -> Result<Speaker, SpeakerError> {
+        let mut conn = pool.acquire().await?;
+        let id = ensure_room_speaker(&mut conn, meeting_id).await?;
+        drop(conn);
+        Self::get_speaker(pool, &id).await
     }
 
     /// Undoes one manual edit, unless the segment has been changed again since.
@@ -540,4 +650,51 @@ mod tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speakers").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
     }
+    #[tokio::test]
+    async fn persists_live_speakers_and_room() {
+        let pool = setup().await;
+        let inputs = vec![
+            AutoSpeakerInput { transcript_id: "t1".into(), speaker_index: Some(0), is_room: false, confidence: Some(0.9) },
+            AutoSpeakerInput { transcript_id: "t2".into(), speaker_index: Some(2), is_room: false, confidence: Some(0.8) },
+            AutoSpeakerInput { transcript_id: "t3".into(), speaker_index: None, is_room: true, confidence: Some(0.5) },
+            AutoSpeakerInput { transcript_id: "t4".into(), speaker_index: None, is_room: false, confidence: None }, // unassigned
+        ];
+        let mut conn = pool.acquire().await.unwrap();
+        persist_auto_speakers(&mut conn, "m1", &inputs).await.unwrap();
+        drop(conn);
+
+        let list = SpeakersRepository::list_speakers(&pool, "m1").await.unwrap();
+        let names: Vec<(&str, &str)> = list.iter().map(|s| (s.display_name.as_str(), s.kind.as_str())).collect();
+        assert!(names.contains(&("Mówca 1", "person")) && names.contains(&("Mówca 3", "person")) && names.contains(&("Sala", "room")));
+        assert_eq!(list.len(), 3); // no "Mówca 2": index 1 was never used
+
+        let segs = SpeakersRepository::list_segment_speakers(&pool, "m1").await.unwrap();
+        let name_of = |id: &str| segs.iter().find(|s| s.transcript_id == id).unwrap().display_name.clone();
+        assert_eq!(name_of("t1").as_deref(), Some("Mówca 1"));
+        assert_eq!(name_of("t2").as_deref(), Some("Mówca 3"));
+        assert_eq!(name_of("t3").as_deref(), Some("Sala"));
+        assert_eq!(name_of("t4"), None);
+        assert_eq!(segs.iter().find(|s| s.transcript_id == "t1").unwrap().confidence, Some(0.9));
+        // persisting twice for the same indices in another meeting is independent
+        let mut conn = pool.acquire().await.unwrap();
+        persist_auto_speakers(&mut conn, "m2", &inputs[..1]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn room_speaker_is_unique_and_protected() {
+        let pool = setup().await;
+        let r1 = SpeakersRepository::get_or_create_room_speaker(&pool, "m1").await.unwrap();
+        let r2 = SpeakersRepository::get_or_create_room_speaker(&pool, "m1").await.unwrap();
+        assert_eq!(r1.id, r2.id);
+        assert_eq!(r1.label, "Sala");
+        // person numbering ignores the room speaker
+        let p = SpeakersRepository::create_speaker(&pool, "m1", None, None).await.unwrap();
+        assert_eq!(p.label, "Mówca 1");
+        assert!(matches!(SpeakersRepository::rename_speaker(&pool, &r1.id, Some("X")).await, Err(SpeakerError::RoomSpeaker)));
+        assert!(matches!(SpeakersRepository::merge_speakers(&pool, &p.id, &r1.id).await, Err(SpeakerError::RoomSpeaker)));
+        // but a segment can be manually assigned to the room
+        let n = SpeakersRepository::assign_segment_speaker(&pool, "m1", &["t1".into()], Some(&r1.id)).await.unwrap();
+        assert_eq!(n.len(), 1);
+    }
+
 }

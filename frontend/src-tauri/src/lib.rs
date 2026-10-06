@@ -655,6 +655,9 @@ pub fn run() {
             whisper_engine::commands::whisper_cancel_download,
             whisper_engine::commands::whisper_delete_corrupted_model,
             // Parakeet engine commands
+            diarization::commands::diarization_get_status,
+            diarization::commands::diarization_set_enabled,
+            diarization::commands::diarization_download_model,
             parakeet_engine::commands::parakeet_init,
             parakeet_engine::commands::parakeet_get_available_models,
             parakeet_engine::commands::parakeet_load_model,

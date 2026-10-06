@@ -18,6 +18,10 @@ export interface Transcript {
   audio_start_time?: number; // Seconds from recording start (e.g., 125.3)
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
+  // Live speaker diarization (absent when disabled)
+  speaker_index?: number | null; // Meeting-local person index (0-based)
+  speaker_is_room?: boolean;     // Overlap / unidentifiable speech ("Sala")
+  speaker_confidence?: number | null;
 }
 
 export interface TranscriptUpdate {
@@ -32,6 +36,9 @@ export interface TranscriptUpdate {
   audio_start_time: number; // Seconds from recording start
   audio_end_time: number;   // Seconds from recording start
   duration: number;          // Segment duration in seconds
+  speaker_index?: number | null;
+  speaker_is_room?: boolean;
+  speaker_confidence?: number | null;
 }
 
 export interface Block {
