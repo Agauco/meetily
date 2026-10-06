@@ -14,4 +14,4 @@ pub mod model;
 
 pub use clusterer::{Assignment, ClustererConfig, OnlineClusterer};
 pub use error::DiarizationError;
-pub use identifier::{SpeakerIdentifier, SpeakerTag};
+pub use identifier::{IdentifierConfig, SpeakerIdentifier, SpeakerKind, SpeakerTag};

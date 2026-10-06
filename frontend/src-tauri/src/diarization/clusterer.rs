@@ -28,11 +28,11 @@ pub struct ClustererConfig {
 impl Default for ClustererConfig {
     fn default() -> Self {
         Self {
-            match_threshold: 0.55,
+            match_threshold: 0.45,
             new_threshold: 0.40,
             max_speakers: 10,
             min_enroll_seconds: 1.5,
-            min_create_seconds: 4.0,
+            min_create_seconds: 3.0,
             max_weight_seconds: 8.0,
         }
     }
@@ -249,10 +249,10 @@ mod tests {
         let mut c = OnlineClusterer::new(cfg);
         c.assign(&vec_with(8, 0, 7, 0.0), 5.0).unwrap();
         let before = c.centroid(0).unwrap().to_vec();
-        // cosine to axis 0 is about 0.47: inside the gray zone (0.40..0.55)
+        // cosine to axis 0 is 0.42: inside the gray zone (0.40..0.45)
         let mut amb = vec![0.0; 8];
-        amb[0] = 0.47;
-        amb[1] = (1.0f32 - 0.47 * 0.47).sqrt();
+        amb[0] = 0.42;
+        amb[1] = (1.0f32 - 0.42 * 0.42).sqrt();
         let a = c.assign(&amb, 5.0).unwrap();
         assert!(!a.is_new && a.confidence < 0.7);
         assert_eq!(c.centroid(0).unwrap(), before.as_slice());
