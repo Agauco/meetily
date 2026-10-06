@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
+import { useCallback, useMemo, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
@@ -9,6 +9,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
+import { SpeakerLabel } from "./SpeakerLabel";
+import type { SpeakerActions } from "@/hooks/useMeetingSpeakers";
+import type { SegmentSpeakerInfo, SpeakerSummary } from "@/types/speakers";
+import { blockIds, computeFollowingCounts } from "@/lib/speakers";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -34,6 +38,10 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    // Speaker diarization (optional): when provided, each segment shows an editable speaker label
+    speakers?: SpeakerSummary[];
+    speakerActions?: SpeakerActions;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -71,6 +79,12 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    speaker,
+    isBlockStart,
+    followingCount,
+    speakers,
+    speakerActions,
+    resolveIds,
 }: {
     id: string;
     timestamp: number;
@@ -78,11 +92,31 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    speaker?: SegmentSpeakerInfo;
+    /** First segment of a run of the same speaker (or a segment without speaker) shows the full label. */
+    isBlockStart: boolean;
+    followingCount: number;
+    speakers?: SpeakerSummary[];
+    speakerActions?: SpeakerActions;
+    resolveIds: (segmentId: string, includeFollowing: boolean) => string[];
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const speakerLabel = speakerActions ? (
+        <div className="mb-1">
+            <SpeakerLabel
+                segmentId={id}
+                speaker={speaker}
+                speakers={speakers ?? []}
+                followingCount={followingCount}
+                actions={speakerActions}
+                resolveIds={resolveIds}
+                compact={!!speaker && !isBlockStart}
+            />
+        </div>
+    ) : null;
 
     return (
-        <div id={`segment-${id}`} className="mb-3">
+        <div id={`segment-${id}`} className="group mb-3">
             <div className="flex items-start gap-2">
                 <Tooltip>
                     <TooltipTrigger>
@@ -97,6 +131,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
+                    {speakerLabel}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -124,6 +159,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    speakers,
+    speakerActions,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -220,6 +257,24 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         return () => scrollElement.removeEventListener('scroll', handleScroll);
     }, [onLoadMore, hasMore, isLoadingMore, isRecording]);
 
+    // Speaker blocks: label is shown at the start of a run of the same speaker
+    const followingCounts = useMemo(
+        () => computeFollowingCounts(segments.map((seg) => seg.speaker?.speakerId)),
+        [segments]
+    );
+    const segmentIdsRef = useRef<string[]>([]);
+    segmentIdsRef.current = segments.map((seg) => seg.id);
+    const followingCountsRef = useRef<number[]>([]);
+    followingCountsRef.current = followingCounts;
+    const resolveIds = useCallback((segmentId: string, includeFollowing: boolean): string[] => {
+        const ids = segmentIdsRef.current;
+        const index = ids.indexOf(segmentId);
+        if (index < 0) return [];
+        return includeFollowing ? blockIds(ids, index, followingCountsRef.current[index] ?? 0) : [segmentId];
+    }, []);
+    const isBlockStartAt = (index: number) =>
+        index === 0 || segments[index].speaker?.speakerId !== segments[index - 1].speaker?.speakerId || !segments[index].speaker;
+
     // Use simple rendering for small lists, virtualization for large lists
     const useVirtualization = segments.length >= VIRTUALIZATION_THRESHOLD;
 
@@ -296,6 +351,12 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={segment.speaker}
+                                        isBlockStart={isBlockStartAt(virtualRow.index)}
+                                        followingCount={followingCounts[virtualRow.index] ?? 0}
+                                        speakers={speakers}
+                                        speakerActions={speakerActions}
+                                        resolveIds={resolveIds}
                                     />
                                 </div>
                             );
@@ -335,7 +396,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                 // Simple rendering for small lists (better animations)
                 <>
                     <div className="space-y-1">
-                        {segments.map((segment) => {
+                        {segments.map((segment, index) => {
                             const isStreaming = streamingSegmentId === segment.id;
 
                             return (
@@ -352,6 +413,12 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={segment.speaker}
+                                        isBlockStart={isBlockStartAt(index)}
+                                        followingCount={followingCounts[index] ?? 0}
+                                        speakers={speakers}
+                                        speakerActions={speakerActions}
+                                        resolveIds={resolveIds}
                                     />
                                 </motion.div>
                             );

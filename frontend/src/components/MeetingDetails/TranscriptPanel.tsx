@@ -5,6 +5,7 @@ import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { useMemo } from 'react';
+import { useMeetingSpeakers } from '@/hooks/useMeetingSpeakers';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -49,20 +50,24 @@ export function TranscriptPanel({
   meetingFolderPath,
   onRefetchTranscripts,
 }: TranscriptPanelProps) {
+  // Voice-based speakers of a saved meeting (inert while recording or without a meeting id)
+  const { speakers, segmentSpeakers, actions: speakerActions } = useMeetingSpeakers(meetingId, !isRecording);
+
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
-    if (usePagination && segments) {
-      return segments;
-    }
-    // Convert transcripts to segments for virtualization
-    return transcripts.map(t => ({
-      id: t.id,
-      timestamp: t.audio_start_time ?? 0,
-      endTime: t.audio_end_time,
-      text: t.text,
-      confidence: t.confidence,
-    }));
-  }, [transcripts, usePagination, segments]);
+    const base: TranscriptSegmentData[] = usePagination && segments
+      ? segments
+      : // Convert transcripts to segments for virtualization
+        transcripts.map(t => ({
+          id: t.id,
+          timestamp: t.audio_start_time ?? 0,
+          endTime: t.audio_end_time,
+          text: t.text,
+          confidence: t.confidence,
+        }));
+    // Attach speaker info (keeps the same objects when a segment has no speaker)
+    return base.map(seg => (segmentSpeakers[seg.id] ? { ...seg, speaker: segmentSpeakers[seg.id] } : seg));
+  }, [transcripts, usePagination, segments, segmentSpeakers]);
 
   return (
     <div className="flex h-full min-w-0 w-full bg-white flex-col relative @container">
@@ -94,6 +99,8 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          speakers={meetingId && !isRecording ? speakers : undefined}
+          speakerActions={meetingId && !isRecording ? speakerActions : undefined}
         />
       </div>
 
