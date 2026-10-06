@@ -28,6 +28,7 @@ Meetily transkrybuje spotkania, ale nie wie, **kto** mówi. Pole `transcripts.sp
 - F6. Po zakończeniu nagrania uruchamia się dokładniejszy przebieg offline, który poprawia etykiety automatyczne, zachowując nazwy i korekty ręczne.
 - F7. Użytkownik może scalić dwóch mówców (automat rozbił jedną osobę na dwie) oraz utworzyć nowego.
 - F8. Podsumowania i action items używają wyświetlanej nazwy mówcy; po zmianie przypisań dostępna jest akcja „wygeneruj podsumowanie ponownie”.
+- F10. Fragmenty, w których mówi kilka osób naraz lub głosu nie da się wiarygodnie przypisać, są oznaczane jako **„Sala”** (zarezerwowany mówca spotkania). „Sala” nie tworzy ani nie aktualizuje profili mówców; użytkownik może ją ręcznie zamienić na konkretną osobę.
 - F9. Funkcję można wyłączyć w ustawieniach; wyłączona nie zmienia dotychczasowego zachowania i nie ładuje modeli.
 
 ### Niefunkcjonalne
@@ -200,3 +201,14 @@ Poniższe wartości przyjęto, żeby spec był kompletny; każdą można zmieni�
 - Integracyjne: nagranie testowe z 3 mówcami (PL) — liczba wykrytych mówców, odsetek błędnie przypisanych sekund; `rediarize_meeting` nie rusza `manual_speaker_id`.
 - UI: nazwanie mówcy, korekta pojedynczego segmentu, zakres, podział, cofnięcie.
 - Wydajność: pomiar narzutu CPU na żywo (N3) i brak wzrostu opóźnienia emisji transkryptu.
+
+## 13. Wyniki fazy 0 (spike na prawdziwym nagraniu)
+
+Nagranie testowe: jeden mikrofon na sali (ok. 9 osób, część nie mówiła) + 2 osoby zdalnie przez głośnik; język polski. Ground truth: ręczne oznaczenia użytkownika dla pierwszych ok. 1:31 (5 osób: A–E; w przerwach między nimi mówiło kilka osób naraz).
+
+- Wydajność: osadzanie + wykrywanie „Sali” ok. 23x szybciej niż czas rzeczywisty na 2 wątkach CPU, najwolniejszy segment (6 s) 0,34 s → nadaje się do pracy na żywo. Tryb działa przyczynowo (segment po segmencie, bez wglądu w przyszłość).
+- Model: WeSpeaker ResNet34 (VoxCeleb). Średnie podobieństwo kosinusowe tego samego mówcy 0,52 vs różnych 0,22; najlepszy pojedynczy próg ok. 0,45. Inne przetestowane modele (WeSpeaker LM, CNCeleb, 3D-Speaker CAM++/ERes2Net) dały w granicach szumu (13/15 vs 11/15 poprawnie na 15 fragmentach) — do ponownej oceny na większej próbce.
+- Progi domyślne (provisional): `match_threshold` 0,45, `new_threshold` 0,40, nowy mówca po ≥ 3 s mowy.
+- „Sala”: wykrywana przez niespójność głosu w oknach 1,5 s wewnątrz segmentu (próg 0,40); 4/4 fragmentów z przerw trafiło do „Sali”, 1 z 13 pojedynczych wypowiedzi oznaczona błędnie jako „Sala”.
+- Wynik online na ground truth: 4 z 5 osób rozdzielone (A, B, C, D), osoba E (3 s) zlana z A; 12/15 fragmentów zgodnych z większościowym etykietą. Podobne głosy i krótkie wypowiedzi pozostają głównym źródłem błędów — stąd ręczna korekta (F4).
+
