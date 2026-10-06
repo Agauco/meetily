@@ -5,6 +5,7 @@ import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
+import { inheritSpeakerNames } from '@/lib/liveSpeakers';
 import { recordingService } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
 
@@ -12,6 +13,8 @@ interface TranscriptContextType {
   transcripts: Transcript[];
   transcriptsRef: MutableRefObject<Transcript[]>
   addTranscript: (update: TranscriptUpdate) => void;
+  /** Applies a live speaker edit (rename / manual correction) to the current recording's transcripts. */
+  updateTranscripts: (updater: (prev: Transcript[]) => Transcript[]) => void;
   copyTranscript: () => void;
   flushBuffer: () => void;
   transcriptContainerRef: React.RefObject<HTMLDivElement>;
@@ -261,7 +264,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           console.log(`Adding ${uniqueNewTranscripts.length} unique transcripts out of ${allNewTranscripts.length} received`);
 
           // Merge with existing transcripts, maintaining chronological order
-          const combined = [...prev, ...uniqueNewTranscripts];
+          const combined = [...prev, ...inheritSpeakerNames(prev, uniqueNewTranscripts)];
 
           // Sort by chunk_start_time first, then by sequence_id
           return combined.sort((a, b) => {
@@ -519,6 +522,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     transcripts,
     transcriptsRef,
     addTranscript,
+    updateTranscripts: setTranscripts,
     copyTranscript,
     flushBuffer,
     transcriptContainerRef,

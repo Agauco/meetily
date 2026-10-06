@@ -96,7 +96,7 @@ pub enum SpeakerError {
 }
 
 /// Voice-based result for one saved transcript segment, as produced live by the diarization engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AutoSpeakerInput {
     pub transcript_id: String,
     /// Meeting-local person index (0-based); `None` when the segment is unassigned or room.
@@ -104,6 +104,13 @@ pub struct AutoSpeakerInput {
     /// True for overlapping / unidentifiable speech ("Sala").
     pub is_room: bool,
     pub confidence: Option<f64>,
+    /// Name the user gave the automatic speaker during the recording (applies to the whole meeting).
+    pub speaker_name: Option<String>,
+    /// Live manual correction of this segment (person index, possibly one created by the user), if any.
+    pub manual_index: Option<usize>,
+    /// Live manual correction to the room speaker.
+    pub manual_is_room: bool,
+    pub manual_name: Option<String>,
 }
 
 async fn ensure_room_speaker(conn: &mut sqlx::SqliteConnection, meeting_id: &str) -> Result<String, sqlx::Error> {
@@ -135,23 +142,39 @@ pub async fn persist_auto_speakers(
     inputs: &[AutoSpeakerInput],
 ) -> Result<(), sqlx::Error> {
     let mut indices: Vec<usize> = inputs.iter().filter(|i| !i.is_room).filter_map(|i| i.speaker_index).collect();
+    indices.extend(inputs.iter().filter(|i| !i.manual_is_room).filter_map(|i| i.manual_index));
     indices.sort_unstable();
     indices.dedup();
+
+    // First non-empty name seen for an index wins.
+    let mut names: HashMap<usize, String> = HashMap::new();
+    for i in inputs {
+        let pairs = [(i.speaker_index.filter(|_| !i.is_room), &i.speaker_name), (i.manual_index.filter(|_| !i.manual_is_room), &i.manual_name)];
+        for (idx, name) in pairs {
+            if let (Some(idx), Some(name)) = (idx, name) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    names.entry(idx).or_insert_with(|| name.to_string());
+                }
+            }
+        }
+    }
 
     let mut ids: HashMap<usize, String> = HashMap::new();
     for index in indices {
         let id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO speakers (id, meeting_id, label, color, created_at, kind) VALUES (?, ?, ?, ?, ?, 'person')")
+        sqlx::query("INSERT INTO speakers (id, meeting_id, label, name, color, created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'person')")
             .bind(&id)
             .bind(meeting_id)
             .bind(format!("Mówca {}", index + 1))
+            .bind(names.get(&index).cloned())
             .bind(SPEAKER_COLORS[index % SPEAKER_COLORS.len()])
             .bind(Utc::now().to_rfc3339())
             .execute(&mut *conn)
             .await?;
         ids.insert(index, id);
     }
-    let room_id = if inputs.iter().any(|i| i.is_room) {
+    let room_id = if inputs.iter().any(|i| i.is_room || i.manual_is_room) {
         Some(ensure_room_speaker(&mut *conn, meeting_id).await?)
     } else {
         None
@@ -163,16 +186,28 @@ pub async fn persist_auto_speakers(
         } else {
             input.speaker_index.and_then(|i| ids.get(&i).cloned())
         };
-        if speaker_id.is_none() {
-            continue;
+        if speaker_id.is_some() {
+            sqlx::query("UPDATE transcripts SET auto_speaker_id = ?, speaker_confidence = ? WHERE id = ? AND meeting_id = ?")
+                .bind(speaker_id)
+                .bind(input.confidence)
+                .bind(&input.transcript_id)
+                .bind(meeting_id)
+                .execute(&mut *conn)
+                .await?;
         }
-        sqlx::query("UPDATE transcripts SET auto_speaker_id = ?, speaker_confidence = ? WHERE id = ? AND meeting_id = ?")
-            .bind(speaker_id)
-            .bind(input.confidence)
-            .bind(&input.transcript_id)
-            .bind(meeting_id)
-            .execute(&mut *conn)
-            .await?;
+        let manual_id = if input.manual_is_room {
+            room_id.clone()
+        } else {
+            input.manual_index.and_then(|i| ids.get(&i).cloned())
+        };
+        if manual_id.is_some() {
+            sqlx::query("UPDATE transcripts SET manual_speaker_id = ? WHERE id = ? AND meeting_id = ?")
+                .bind(manual_id)
+                .bind(&input.transcript_id)
+                .bind(meeting_id)
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -654,10 +689,10 @@ mod tests {
     async fn persists_live_speakers_and_room() {
         let pool = setup().await;
         let inputs = vec![
-            AutoSpeakerInput { transcript_id: "t1".into(), speaker_index: Some(0), is_room: false, confidence: Some(0.9) },
-            AutoSpeakerInput { transcript_id: "t2".into(), speaker_index: Some(2), is_room: false, confidence: Some(0.8) },
-            AutoSpeakerInput { transcript_id: "t3".into(), speaker_index: None, is_room: true, confidence: Some(0.5) },
-            AutoSpeakerInput { transcript_id: "t4".into(), speaker_index: None, is_room: false, confidence: None }, // unassigned
+            AutoSpeakerInput { transcript_id: "t1".into(), speaker_index: Some(0), is_room: false, confidence: Some(0.9), ..Default::default() },
+            AutoSpeakerInput { transcript_id: "t2".into(), speaker_index: Some(2), is_room: false, confidence: Some(0.8), ..Default::default() },
+            AutoSpeakerInput { transcript_id: "t3".into(), speaker_index: None, is_room: true, confidence: Some(0.5), ..Default::default() },
+            AutoSpeakerInput { transcript_id: "t4".into(), speaker_index: None, is_room: false, confidence: None, ..Default::default() }, // unassigned
         ];
         let mut conn = pool.acquire().await.unwrap();
         persist_auto_speakers(&mut conn, "m1", &inputs).await.unwrap();
@@ -678,6 +713,26 @@ mod tests {
         // persisting twice for the same indices in another meeting is independent
         let mut conn = pool.acquire().await.unwrap();
         persist_auto_speakers(&mut conn, "m2", &inputs[..1]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_names_and_manual_overrides_are_persisted() {
+        let pool = setup().await;
+        let inputs = vec![
+            AutoSpeakerInput { transcript_id: "t1".into(), speaker_index: Some(0), speaker_name: Some("Anna".into()), ..Default::default() },
+            AutoSpeakerInput { transcript_id: "t2".into(), speaker_index: Some(0), speaker_name: Some("Anna".into()), manual_index: Some(1), manual_name: Some("Piotr".into()), ..Default::default() },
+            AutoSpeakerInput { transcript_id: "t3".into(), speaker_index: Some(0), speaker_name: Some("Anna".into()), manual_is_room: true, ..Default::default() },
+        ];
+        let mut conn = pool.acquire().await.unwrap();
+        persist_auto_speakers(&mut conn, "m1", &inputs).await.unwrap();
+        drop(conn);
+        let segs = SpeakersRepository::list_segment_speakers(&pool, "m1").await.unwrap();
+        let get = |id: &str| segs.iter().find(|s| s.transcript_id == id).unwrap().clone();
+        assert_eq!(get("t1").display_name.as_deref(), Some("Anna"));
+        assert!(!get("t1").is_manual);
+        assert_eq!(get("t2").display_name.as_deref(), Some("Piotr"));
+        assert!(get("t2").is_manual);
+        assert_eq!(get("t3").display_name.as_deref(), Some("Sala"));
     }
 
     #[tokio::test]

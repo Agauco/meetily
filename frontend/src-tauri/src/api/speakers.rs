@@ -113,6 +113,20 @@ pub async fn api_assign_segment_speaker<R: Runtime>(
     Ok(edit_ids)
 }
 
+/// Returns the meeting's reserved "Sala" speaker (overlapping / unidentifiable speech), creating it when missing.
+#[tauri::command]
+pub async fn api_get_room_speaker<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Speaker, String> {
+    let speaker = SpeakersRepository::get_or_create_room_speaker(state.db_manager.pool(), &meeting_id)
+        .await
+        .map_err(|e| to_err("Failed to get room speaker", e))?;
+    notify(&app, &meeting_id, "room");
+    Ok(speaker)
+}
+
 /// Merges `from_speaker_id` into `into_speaker_id`; returns the surviving speaker id.
 #[tauri::command]
 pub async fn api_merge_speakers<R: Runtime>(

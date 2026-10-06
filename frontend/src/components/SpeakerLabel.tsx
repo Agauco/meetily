@@ -71,7 +71,10 @@ export const SpeakerLabel = memo(function SpeakerLabel({
     };
 
     const ids = () => resolveIds(segmentId, includeFollowing && followingCount > 0);
-    const otherSpeakers = speakers.filter((s) => s.id !== speaker?.speakerId);
+    const currentSummary = speakers.find((s) => s.id === speaker?.speakerId);
+    const isRoom = currentSummary?.kind === 'room';
+    const hasRoom = speakers.some((s) => s.kind === 'room');
+    const otherSpeakers = speakers.filter((s) => s.id !== speaker?.speakerId && s.kind !== 'room');
 
     return (
         <Popover open={open} onOpenChange={onOpenChange}>
@@ -109,7 +112,7 @@ export const SpeakerLabel = memo(function SpeakerLabel({
                 )}
             </PopoverTrigger>
             <PopoverContent align="start" className="w-72 space-y-3 p-3 text-sm">
-                {speaker && (
+                {speaker && !isRoom && (
                     <div>
                         <label className="mb-1 block text-xs font-medium text-gray-500">
                             Nazwa mówcy (dla całego spotkania)
@@ -153,6 +156,19 @@ export const SpeakerLabel = memo(function SpeakerLabel({
                                 </button>
                             </li>
                         ))}
+                        {!hasRoom && (
+                            <li>
+                                <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => run(() => actions.assignRoom(ids()))}
+                                    className="flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-gray-100"
+                                >
+                                    <Dot color="#6B7280" />
+                                    <span className="flex-1 truncate">Sala (kilka osób naraz)</span>
+                                </button>
+                            </li>
+                        )}
                         {speakers.length === 0 && <li className="px-2 py-1 text-xs text-gray-400">Brak mówców — dodaj pierwszego poniżej.</li>}
                     </ul>
                     <div className="mt-1 flex gap-1">
@@ -198,7 +214,7 @@ export const SpeakerLabel = memo(function SpeakerLabel({
                     )}
                 </div>
 
-                {speaker && otherSpeakers.length > 0 && (
+                {speaker && !isRoom && otherSpeakers.length > 0 && (
                     <div className="border-t border-gray-100 pt-2">
                         <div className="mb-1 text-xs font-medium text-gray-500">Scal „{speaker.name}” z innym mówcą</div>
                         <div className="flex gap-1">

@@ -48,12 +48,16 @@ impl TranscriptsRepository {
         let mut speaker_inputs: Vec<AutoSpeakerInput> = Vec::new();
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
-            if segment.speaker_index.is_some() || segment.speaker_is_room {
+            if segment.speaker_index.is_some() || segment.speaker_is_room || segment.manual_speaker_index.is_some() || segment.manual_speaker_is_room {
                 speaker_inputs.push(AutoSpeakerInput {
                     transcript_id: transcript_id.clone(),
                     speaker_index: segment.speaker_index.filter(|i| *i >= 0).map(|i| i as usize),
                     is_room: segment.speaker_is_room,
                     confidence: segment.speaker_confidence,
+                    speaker_name: segment.speaker_name.clone(),
+                    manual_index: segment.manual_speaker_index.filter(|i| *i >= 0).map(|i| i as usize),
+                    manual_is_room: segment.manual_speaker_is_room,
+                    manual_name: segment.manual_speaker_name.clone(),
                 });
             }
             let result = sqlx::query(
