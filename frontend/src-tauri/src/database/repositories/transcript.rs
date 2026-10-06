@@ -1,3 +1,4 @@
+use crate::database::repositories::speaker::{persist_auto_speakers, AutoSpeakerInput};
 use crate::api::{TranscriptSearchResult, TranscriptSegment};
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
@@ -44,8 +45,17 @@ impl TranscriptsRepository {
         info!("Successfully created meeting with id: {}", meeting_id);
 
         // 2. Save each transcript segment with audio timing fields
+        let mut speaker_inputs: Vec<AutoSpeakerInput> = Vec::new();
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
+            if segment.speaker_index.is_some() || segment.speaker_is_room {
+                speaker_inputs.push(AutoSpeakerInput {
+                    transcript_id: transcript_id.clone(),
+                    speaker_index: segment.speaker_index.filter(|i| *i >= 0).map(|i| i as usize),
+                    is_room: segment.speaker_is_room,
+                    confidence: segment.speaker_confidence,
+                });
+            }
             let result = sqlx::query(
                 "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
                  VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -65,6 +75,15 @@ impl TranscriptsRepository {
                     "Failed to save transcript segment for meeting {}: {}",
                     meeting_id, e
                 );
+                transaction.rollback().await?;
+                return Err(e);
+            }
+        }
+
+        // 3. Persist live speaker assignments (no-op when diarization was off)
+        if !speaker_inputs.is_empty() {
+            if let Err(e) = persist_auto_speakers(&mut *transaction, &meeting_id, &speaker_inputs).await {
+                error!("Failed to persist speakers for meeting {}: {}", meeting_id, e);
                 transaction.rollback().await?;
                 return Err(e);
             }

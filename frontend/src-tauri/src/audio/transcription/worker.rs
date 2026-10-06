@@ -42,6 +42,13 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    // Live speaker diarization (None / false when diarization is disabled)
+    #[serde(default)]
+    pub speaker_index: Option<usize>, // Meeting-local person index (0-based)
+    #[serde(default)]
+    pub speaker_is_room: bool, // Overlap / unidentifiable speech ("Sala")
+    #[serde(default)]
+    pub speaker_confidence: Option<f32>,
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -70,6 +77,9 @@ pub fn start_transcription_task<R: Runtime>(
             }
         };
 
+        // Live speaker identification (None when disabled or the model is unavailable)
+        let speaker_identifier = crate::diarization::commands::create_identifier(&app);
+
         // Create parallel workers for faster processing while preserving ALL chunks
         const NUM_WORKERS: usize = 1; // Serial processing ensures transcripts emit in chronological order
         let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
@@ -95,6 +105,7 @@ pub fn start_transcription_task<R: Runtime>(
             let chunks_completed_clone = chunks_completed.clone();
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
+            let identifier_clone = speaker_identifier.clone();
 
             let worker_handle = tokio::spawn(async move {
                 info!("👷 Worker {} started", worker_id);
@@ -150,13 +161,37 @@ pub fn start_transcription_task<R: Runtime>(
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
+                            // Speaker identification runs in parallel with transcription on a blocking
+                            // thread; it is awaited for every chunk so clustering stays in recording order.
+                            let speaker_samples: Option<Vec<f32>> = identifier_clone.as_ref().map(|_| {
+                                if chunk.sample_rate != 16000 {
+                                    crate::audio::audio_processing::resample_audio(&chunk.data, chunk.sample_rate, 16000)
+                                } else {
+                                    chunk.data.clone()
+                                }
+                            });
+                            let speaker_task = match (identifier_clone.clone(), speaker_samples) {
+                                (Some(identifier), Some(samples)) => Some(tokio::task::spawn_blocking(move || {
+                                    match identifier.lock() {
+                                        Ok(mut id) => id.identify(&samples),
+                                        Err(_) => None,
+                                    }
+                                })),
+                                _ => None,
+                            };
+
                             // Transcribe with provider-agnostic approach
-                            match transcribe_chunk_with_provider(
+                            let transcription_result = transcribe_chunk_with_provider(
                                 &engine_clone,
                                 chunk,
                                 &app_clone,
                             )
-                            .await
+                            .await;
+                            let speaker_tag = match speaker_task {
+                                Some(handle) => handle.await.ok().flatten(),
+                                None => None,
+                            };
+                            match transcription_result
                             {
                                 Ok((transcript, confidence_opt, is_partial)) => {
                                     let confidence_str = match confidence_opt {
@@ -215,6 +250,15 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_start_time,
                                             audio_end_time,
                                             duration: chunk_duration,
+                                            speaker_index: match speaker_tag.as_ref().map(|t| &t.kind) {
+                                                Some(crate::diarization::SpeakerKind::Person(i)) => Some(*i),
+                                                _ => None,
+                                            },
+                                            speaker_is_room: matches!(
+                                                speaker_tag.as_ref().map(|t| &t.kind),
+                                                Some(crate::diarization::SpeakerKind::Room)
+                                            ),
+                                            speaker_confidence: speaker_tag.as_ref().map(|t| t.confidence),
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)

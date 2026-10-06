@@ -6,6 +6,7 @@ export interface SpeakerSummary {
   name: string | null; // user-provided name
   display_name: string; // name ?? label
   color: string | null;
+  kind: 'person' | 'room'; // the room ("Sala") speaker cannot be renamed or merged
   utterance_count: number;
   total_duration: number;
 }
