@@ -23,10 +23,40 @@ const listen = mock(async (_name: string, handler: typeof eventHandler) => {
   eventHandler = handler;
   return unlisten;
 });
+// When another test file has already loaded the hook with the real Tauri API, module mocks no longer
+// apply, so the same mocks are also exposed through the Tauri IPC globals the real API calls into.
+const g = globalThis as Record<string, any>;
+const hadWindow = 'window' in g;
+const previousWindow = g.window;
+if (!hadWindow) g.window = g;
+const previousInternals = g.window.__TAURI_INTERNALS__;
+const previousEventInternals = g.window.__TAURI_EVENT_PLUGIN_INTERNALS__;
+const callbacks = new Map<number, (event: { payload: { meeting_id: string } }) => void>();
+let nextCallbackId = 1;
+g.window.__TAURI_INTERNALS__ = {
+  transformCallback: (cb: (event: { payload: { meeting_id: string } }) => void) => {
+    const id = nextCallbackId++;
+    callbacks.set(id, cb);
+    return id;
+  },
+  invoke: async (cmd: string, args: Record<string, any>) => {
+    if (cmd === 'plugin:event|listen') {
+      await listen(args.event, callbacks.get(args.handler) as typeof eventHandler);
+      return args.handler;
+    }
+    if (cmd === 'plugin:event|unlisten') return unlisten();
+    return invoke(cmd, args);
+  },
+};
+g.window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
 mock.module('@tauri-apps/api/core', () => ({ ...originalCore, invoke }));
 mock.module('@tauri-apps/api/event', () => ({ ...originalEvent, listen }));
 const { useMeetingSpeakers } = await import('../../src/hooks/useMeetingSpeakers');
 afterAll(() => {
+  g.window.__TAURI_INTERNALS__ = previousInternals;
+  g.window.__TAURI_EVENT_PLUGIN_INTERNALS__ = previousEventInternals;
+  if (!hadWindow) delete g.window;
+  else g.window = previousWindow;
   mock.module('@tauri-apps/api/core', () => originalCore);
   mock.module('@tauri-apps/api/event', () => originalEvent);
 });
