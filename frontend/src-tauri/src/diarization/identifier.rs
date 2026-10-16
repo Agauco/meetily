@@ -7,6 +7,7 @@
 use super::clusterer::{ClustererConfig, OnlineClusterer};
 use super::embedder::{cosine, SpeakerEmbedder, MIN_EMBED_SAMPLES};
 use super::error::DiarizationError;
+use super::offline::VoiceSegment;
 use super::fbank::SAMPLE_RATE;
 use std::path::Path;
 
@@ -78,6 +79,55 @@ pub(crate) fn mean_pairwise_cosine(embeddings: &[Vec<f32>]) -> Option<f32> {
     Some(sum / n as f32)
 }
 
+/// How consistent the voice is across the segment (1 = one voice, low = several voices);
+/// `None` for segments too short to measure.
+pub(crate) fn voice_consistency(embedder: &mut SpeakerEmbedder, cfg: &IdentifierConfig, samples: &[f32]) -> Option<f32> {
+    let seconds = samples.len() as f32 / SAMPLE_RATE as f32;
+    if seconds < cfg.consistency_min_seconds {
+        return None;
+    }
+    let win = (cfg.window_seconds * SAMPLE_RATE as f32) as usize;
+    let hop = ((cfg.hop_seconds * SAMPLE_RATE as f32) as usize).max(1);
+    let mut embeddings = Vec::new();
+    let mut start = 0usize;
+    while start + win <= samples.len() {
+        if let Ok(e) = embedder.embed(&samples[start..start + win]) {
+            embeddings.push(e);
+        }
+        start += hop;
+    }
+    mean_pairwise_cosine(&embeddings)
+}
+
+/// Room decision confidence for a measured consistency below the threshold.
+fn room_confidence(cfg: &IdentifierConfig, consistency: f32) -> f32 {
+    ((cfg.room_consistency_threshold - consistency) / cfg.room_consistency_threshold)
+        .clamp(0.0, 1.0)
+        .max(0.5)
+}
+
+/// Voice analysis of one segment for the offline pass: room detection + one embedding.
+/// Never clusters; segments too short to embed come back without an embedding.
+pub fn analyze_segment(embedder: &mut SpeakerEmbedder, cfg: &IdentifierConfig, samples_16k: &[f32]) -> VoiceSegment {
+    let seconds = samples_16k.len() as f32 / SAMPLE_RATE as f32;
+    let mut out = VoiceSegment { seconds, ..Default::default() };
+    if samples_16k.len() < MIN_EMBED_SAMPLES {
+        return out;
+    }
+    if let Some(consistency) = voice_consistency(embedder, cfg, samples_16k) {
+        if consistency < cfg.room_consistency_threshold {
+            out.is_room = true;
+            out.room_confidence = room_confidence(cfg, consistency);
+            return out;
+        }
+    }
+    match embedder.embed(samples_16k) {
+        Ok(e) => out.embedding = Some(e),
+        Err(e) => log::warn!("Speaker embedding failed: {}", e),
+    }
+    out
+}
+
 impl SpeakerIdentifier {
     pub fn new(model_path: &Path, cfg: IdentifierConfig, threads: usize) -> Result<Self, DiarizationError> {
         Ok(Self {
@@ -91,23 +141,8 @@ impl SpeakerIdentifier {
         self.clusterer.speaker_count()
     }
 
-    /// How consistent the voice is across the segment (1 = one voice, low = several voices).
     fn voice_consistency(&mut self, samples: &[f32]) -> Option<f32> {
-        let seconds = samples.len() as f32 / SAMPLE_RATE as f32;
-        if seconds < self.cfg.consistency_min_seconds {
-            return None;
-        }
-        let win = (self.cfg.window_seconds * SAMPLE_RATE as f32) as usize;
-        let hop = ((self.cfg.hop_seconds * SAMPLE_RATE as f32) as usize).max(1);
-        let mut embeddings = Vec::new();
-        let mut start = 0usize;
-        while start + win <= samples.len() {
-            if let Ok(e) = self.embedder.embed(&samples[start..start + win]) {
-                embeddings.push(e);
-            }
-            start += hop;
-        }
-        mean_pairwise_cosine(&embeddings)
+        voice_consistency(&mut self.embedder, &self.cfg, samples)
     }
 
     /// Identifies the speaker of 16 kHz mono samples in [-1, 1].
@@ -121,9 +156,7 @@ impl SpeakerIdentifier {
 
         if let Some(consistency) = self.voice_consistency(samples_16k) {
             if consistency < self.cfg.room_consistency_threshold {
-                let confidence = ((self.cfg.room_consistency_threshold - consistency) / self.cfg.room_consistency_threshold)
-                    .clamp(0.0, 1.0)
-                    .max(0.5);
+                let confidence = room_confidence(&self.cfg, consistency);
                 return Some(SpeakerTag { kind: SpeakerKind::Room, confidence, is_new: false });
             }
         }

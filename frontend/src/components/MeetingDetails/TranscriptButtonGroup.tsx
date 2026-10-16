@@ -6,6 +6,7 @@ import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
+import { RediarizeButton } from './RediarizeButton';
 import { useConfig } from '@/contexts/ConfigContext';
 
 
@@ -85,6 +86,8 @@ export function TranscriptButtonGroup({
           </Button>
         )}
       </ButtonGroup>
+
+      {meetingId && meetingFolderPath && <RediarizeButton meetingId={meetingId} />}
 
       {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
         <RetranscribeDialog
