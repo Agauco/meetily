@@ -28,3 +28,22 @@ export interface SegmentSpeakerInfo {
   isManual: boolean;
   confidence?: number;
 }
+
+/** Result of an offline (re)diarization pass. Mirrors `RediarizeSummary` in src-tauri/src/diarization/rediarize.rs */
+export interface RediarizeSummary {
+  meeting_id: string;
+  segments_total: number;
+  segments_analyzed: number;
+  speaker_count: number;
+  changed_transcript_ids: string[];
+  created_speakers: number;
+  removed_speakers: number;
+}
+
+/** `speaker-diarization-progress` event payload. */
+export interface DiarizationProgress {
+  meeting_id: string;
+  stage: 'decoding' | 'analyzing' | 'saving' | 'done' | 'failed';
+  progress: number; // 0..100
+  error?: string;
+}

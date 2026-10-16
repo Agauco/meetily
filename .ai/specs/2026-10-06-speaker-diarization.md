@@ -164,7 +164,7 @@ Transkrypt przekazywany do `summary/` jest formatowany jako `Nazwa mówcy: tekst
 | 1 | Migracja + modele + repozytoria + komendy `list/rename/assign/merge` (bez algorytmu) | testy jednostkowe repozytoriów; stare dane bez regresji |
 | 2 | Rozszerzenie `TranscriptUpdate`/`Transcript`, UI etykiet, nazywanie, ręczna korekta pojedynczego segmentu | działa na danych testowych bez algorytmu |
 | 3 | `embedder` + `online_clusterer` + zadanie diaryzacji na żywo | etykiety live w nagraniu 2–4 osób, brak utraty chunków |
-| 4 | Przebieg offline po zatrzymaniu, scalanie z korektami ręcznymi | korekty ręczne zachowane po `rediarize_meeting` |
+| 4 ✅ | Przebieg offline po zatrzymaniu, scalanie z korektami ręcznymi | korekty ręczne zachowane po `rediarize_meeting` |
 | 5 | Podział segmentu, zakres, cofanie (`speaker_edits`) | testy UI + testy komend |
 | 6 | Integracja z podsumowaniami, regeneracja, dokumentacja (`docs/`) | podsumowanie zawiera nazwy mówców |
 | 7 | Ustawienia, pobieranie modeli, wydajność (N3), Windows/macOS | build na obu platformach |
@@ -211,4 +211,17 @@ Nagranie testowe: jeden mikrofon na sali (ok. 9 osób, część nie mówiła) + 
 - Progi domyślne (provisional): `match_threshold` 0,45, `new_threshold` 0,40, nowy mówca po ≥ 3 s mowy.
 - „Sala”: wykrywana przez niespójność głosu w oknach 1,5 s wewnątrz segmentu (próg 0,40); 4/4 fragmentów z przerw trafiło do „Sali”, 1 z 13 pojedynczych wypowiedzi oznaczona błędnie jako „Sala”.
 - Wynik online na ground truth: 4 z 5 osób rozdzielone (A, B, C, D), osoba E (3 s) zlana z A; 12/15 fragmentów zgodnych z większościowym etykietą. Podobne głosy i krótkie wypowiedzi pozostają głównym źródłem błędów — stąd ręczna korekta (F4).
+
+## 14. Faza 4 — przebieg offline (implementacja)
+
+Zamiast sherpa-onnx (A1) użyto własnego potoku na istniejącym modelu WeSpeaker: segmentację dają gotowe segmenty transkrypcji, więc nie jest potrzebny osobny model segmentacji ani nowa natywna zależność.
+
+- **Wejście:** nagranie spotkania (`folder_path` → plik audio, dekodowane do 16 kHz mono) i czasy segmentów `audio_start_time`/`audio_end_time`.
+- **Analiza segmentu** (`identifier::analyze_segment`): wycięcie ciszy (ramki 25 ms poniżej 15% p90 RMS), wykrycie „Sali” jak na żywo, jeden embedding na segment.
+- **Klasteryzacja** (`diarization/offline.rs`): aglomeracyjna, average linkage, na segmentach ≥ 1,5 s; próg łączenia 0,35; klastry z mniej niż 3 s mowy są dołączane do najbliższego; krótkie segmenty przypisywane do najbliższego centroidu (pewność × 0,85, poniżej 0,15 → „Sala”). `expected_speakers` wymusza liczbę mówców, `max_speakers` z ustawień jest limitem.
+- **Mapowanie na istniejących mówców:** klaster dziedziczy mówcę (nazwę, kolor), z którym dzieli najwięcej czasu mowy według *wyświetlanego* przypisania (korekta ręczna, inaczej automat; po scaleniach). Klastry bez wspólnych segmentów porównywane są głosem (centroid ≥ 0,45) z pozostałymi mówcami; reszta dostaje nowych „Mówca N” (numer po najwyższym istniejącym).
+- **Zapis** (`SpeakersRepository::apply_offline_assignments`, jedna transakcja): tylko `auto_speaker_id` i `speaker_confidence`; `manual_speaker_id` nigdy nie jest zmieniany. Segmenty, których nie dało się przeanalizować, zachowują poprzednią etykietę. Centroidy zapisywane w `speakers.centroid`. Nienazwani mówcy bez żadnego segmentu (i bez odwołań w scaleniach i historii korekt) są usuwani.
+- **Uruchamianie:** automatycznie w tle po zapisaniu nagranego spotkania (`api_save_transcript`, gdy diaryzacja włączona i model pobrany; czeka do 60 s na plik audio) oraz ręcznie: `api_rediarize_meeting(meeting_id, expected_speakers?)` — przycisk „Mówcy” w transkrypcie spotkania z opcjonalną liczbą mówców. Jedno uruchomienie na spotkanie naraz (`api_is_rediarizing`).
+- **Zdarzenia:** `speaker-diarization-progress {meeting_id, stage, progress, error?}`, `speakers-relabeled` (podsumowanie z listą `changed_transcript_ids`) oraz `speaker-updated` (`kind: "rediarize"`), na które odświeża się widok.
+- **Poprawka przy okazji:** `create_speaker` numerował „Mówca N” według liczby mówców, co po lukach w numeracji z nagrania na żywo dawało duplikaty etykiet; teraz bierze numer po najwyższym istniejącym.
 

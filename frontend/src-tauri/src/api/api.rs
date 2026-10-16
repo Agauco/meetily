@@ -951,7 +951,7 @@ pub async fn api_save_meeting_title<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_save_transcript<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
@@ -1009,6 +1009,8 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            // Refine speaker labels offline in the background (no-op when diarization is off).
+            crate::diarization::rediarize::spawn_after_save(&app, meeting_id.clone());
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",

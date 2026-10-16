@@ -77,6 +77,17 @@ pub struct SpeakerEdit {
     pub undone: bool,
 }
 
+/// Timing and speakers of one segment, as needed by the offline diarization pass.
+#[derive(Debug, Clone, FromRow)]
+pub struct DiarizationSegmentRow {
+    pub id: String,
+    pub audio_start_time: Option<f64>,
+    pub audio_end_time: Option<f64>,
+    pub duration: Option<f64>,
+    pub auto_speaker_id: Option<String>,
+    pub manual_speaker_id: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpeakerError {
     #[error("database error: {0}")]
@@ -212,6 +223,54 @@ pub async fn persist_auto_speakers(
     Ok(())
 }
 
+/// Next free "Mówca N" number in a meeting. Uses the highest existing number (not the count), because
+/// live numbering can skip indices and offline cleanup can remove speakers.
+async fn next_person_number(conn: &mut sqlx::SqliteConnection, meeting_id: &str) -> Result<usize, sqlx::Error> {
+    let labels: Vec<String> = sqlx::query_scalar("SELECT label FROM speakers WHERE meeting_id = ? AND kind = 'person'")
+        .bind(meeting_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    let max = labels
+        .iter()
+        .filter_map(|l| l.strip_prefix("Mówca ").and_then(|n| n.trim().parse::<usize>().ok()))
+        .max()
+        .unwrap_or(0);
+    Ok(max.max(labels.len()) + 1)
+}
+
+fn centroid_bytes(centroid: &[f32]) -> Vec<u8> {
+    centroid.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Target of one segment in an offline (re)diarization result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OfflineTarget {
+    /// An existing speaker of the meeting keeps this voice (name and color preserved).
+    Existing(String),
+    /// A new speaker, identified by the offline cluster index (several segments share one).
+    New(usize),
+    /// Overlapping / unidentifiable speech ("Sala").
+    Room,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfflineAssignment {
+    pub transcript_id: String,
+    pub target: OfflineTarget,
+    pub confidence: f64,
+}
+
+/// Result of writing an offline diarization.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OfflineApplyResult {
+    /// Segments whose automatic speaker changed.
+    pub changed_transcript_ids: Vec<String>,
+    /// Speakers created by this pass.
+    pub created_speakers: usize,
+    /// Unnamed speakers left without any segment and removed.
+    pub removed_speakers: usize,
+}
+
 pub struct SpeakersRepository;
 
 /// Follows `merged_into` links to the active (root) speaker.
@@ -256,11 +315,10 @@ impl SpeakersRepository {
         name: Option<&str>,
         centroid: Option<&[f32]>,
     ) -> Result<Speaker, SpeakerError> {
-        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE meeting_id = ? AND kind = 'person'")
-            .bind(meeting_id)
-            .fetch_one(pool)
-            .await?;
-        let n = existing as usize + 1;
+        let n = {
+            let mut conn = pool.acquire().await?;
+            next_person_number(&mut conn, meeting_id).await?
+        };
         let speaker = Speaker {
             id: Uuid::new_v4().to_string(),
             meeting_id: meeting_id.to_string(),
@@ -271,8 +329,7 @@ impl SpeakersRepository {
             merged_into: None,
             kind: KIND_PERSON.to_string(),
         };
-        let centroid_bytes: Option<Vec<u8>> =
-            centroid.map(|c| c.iter().flat_map(|v| v.to_le_bytes()).collect());
+        let centroid_bytes: Option<Vec<u8>> = centroid.map(centroid_bytes);
         sqlx::query(
             "INSERT INTO speakers (id, meeting_id, label, name, color, centroid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -519,6 +576,172 @@ impl SpeakersRepository {
             .collect())
     }
 
+    /// Writes the result of an offline (re)diarization in one transaction.
+    ///
+    /// Only `auto_speaker_id` / `speaker_confidence` are written — manual overrides are never touched.
+    /// Segments not listed keep their current automatic speaker. `centroids` (per offline cluster) are
+    /// stored on new speakers and refreshed on existing ones. Unnamed person speakers that end up with
+    /// no segment at all (and are not referenced by merges or the edit history) are removed.
+    pub async fn apply_offline_assignments(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        assignments: &[OfflineAssignment],
+        existing_centroids: &HashMap<String, Vec<f32>>,
+        new_centroids: &HashMap<usize, Vec<f32>>,
+    ) -> Result<OfflineApplyResult, SpeakerError> {
+        let mut tx = pool.begin().await?;
+        let mut result = OfflineApplyResult::default();
+
+        // Existing targets must be active speakers of this meeting.
+        let known: HashMap<String, (String, Option<String>)> =
+            sqlx::query_as::<_, (String, String, Option<String>)>("SELECT id, kind, merged_into FROM speakers WHERE meeting_id = ?")
+                .bind(meeting_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|(id, kind, merged)| (id, (kind, merged)))
+                .collect();
+        for a in assignments {
+            if let OfflineTarget::Existing(id) = &a.target {
+                match known.get(id) {
+                    None => return Err(SpeakerError::WrongMeeting(id.clone())),
+                    Some((kind, _)) if kind == KIND_ROOM => return Err(SpeakerError::RoomSpeaker),
+                    _ => {}
+                }
+            }
+        }
+
+        // Create new speakers (in cluster order, so numbering follows first appearance).
+        let mut new_clusters: Vec<usize> = assignments
+            .iter()
+            .filter_map(|a| if let OfflineTarget::New(c) = a.target { Some(c) } else { None })
+            .collect();
+        new_clusters.sort_unstable();
+        new_clusters.dedup();
+        let mut new_ids: HashMap<usize, String> = HashMap::new();
+        for cluster in new_clusters {
+            let n = next_person_number(&mut *tx, meeting_id).await?;
+            let id = Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO speakers (id, meeting_id, label, color, centroid, created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'person')")
+                .bind(&id)
+                .bind(meeting_id)
+                .bind(format!("Mówca {}", n))
+                .bind(SPEAKER_COLORS[(n - 1) % SPEAKER_COLORS.len()])
+                .bind(new_centroids.get(&cluster).map(|c| centroid_bytes(c)))
+                .bind(Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            new_ids.insert(cluster, id);
+            result.created_speakers += 1;
+        }
+        for (id, centroid) in existing_centroids {
+            sqlx::query("UPDATE speakers SET centroid = ? WHERE id = ? AND meeting_id = ?")
+                .bind(centroid_bytes(centroid))
+                .bind(id)
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let room_id = if assignments.iter().any(|a| a.target == OfflineTarget::Room) {
+            Some(ensure_room_speaker(&mut *tx, meeting_id).await?)
+        } else {
+            None
+        };
+
+        let current: HashMap<String, Option<String>> =
+            sqlx::query_as::<_, (String, Option<String>)>("SELECT id, auto_speaker_id FROM transcripts WHERE meeting_id = ?")
+                .bind(meeting_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .collect();
+        for a in assignments {
+            let Some(old) = current.get(&a.transcript_id) else { continue };
+            let new = match &a.target {
+                OfflineTarget::Existing(id) => Some(id.clone()),
+                OfflineTarget::New(c) => new_ids.get(c).cloned(),
+                OfflineTarget::Room => room_id.clone(),
+            };
+            if new.is_none() {
+                continue;
+            }
+            sqlx::query("UPDATE transcripts SET auto_speaker_id = ?, speaker_confidence = ? WHERE id = ? AND meeting_id = ?")
+                .bind(&new)
+                .bind(a.confidence)
+                .bind(&a.transcript_id)
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+            // "changed" = the speaker the automatic decision points to (after merges) is different
+            let resolve = |id: &Option<String>| -> Option<String> {
+                let mut cur = id.clone()?;
+                for _ in 0..MAX_MERGE_DEPTH {
+                    match known.get(&cur).and_then(|(_, m)| m.clone()) {
+                        Some(next) if next != cur => cur = next,
+                        _ => break,
+                    }
+                }
+                Some(cur)
+            };
+            if resolve(old) != resolve(&new) {
+                result.changed_transcript_ids.push(a.transcript_id.clone());
+            }
+        }
+
+        let removed = sqlx::query(
+            "DELETE FROM speakers WHERE meeting_id = ?1 AND kind = 'person' AND name IS NULL AND merged_into IS NULL
+               AND id NOT IN (SELECT auto_speaker_id FROM transcripts WHERE meeting_id = ?1 AND auto_speaker_id IS NOT NULL)
+               AND id NOT IN (SELECT manual_speaker_id FROM transcripts WHERE meeting_id = ?1 AND manual_speaker_id IS NOT NULL)
+               AND id NOT IN (SELECT merged_into FROM speakers WHERE meeting_id = ?1 AND merged_into IS NOT NULL)
+               AND id NOT IN (SELECT old_speaker FROM speaker_edits WHERE meeting_id = ?1 AND old_speaker IS NOT NULL)
+               AND id NOT IN (SELECT new_speaker FROM speaker_edits WHERE meeting_id = ?1 AND new_speaker IS NOT NULL)",
+        )
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+        result.removed_speakers = removed.rows_affected() as usize;
+
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Segment timing and current speakers of a meeting, ordered by time (input for the offline pass).
+    pub async fn list_segments_for_diarization(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Vec<DiarizationSegmentRow>, SpeakerError> {
+        Ok(sqlx::query_as::<_, DiarizationSegmentRow>(
+            "SELECT id, audio_start_time, audio_end_time, duration, auto_speaker_id, manual_speaker_id
+             FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC, rowid ASC",
+        )
+        .bind(meeting_id)
+        .fetch_all(pool)
+        .await?)
+    }
+
+    /// Displayed *person* speaker (manual override, else automatic; resolved through merges) of each
+    /// given row; `None` for unassigned and room segments.
+    pub async fn displayed_person_speakers(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        rows: &[DiarizationSegmentRow],
+    ) -> Result<Vec<Option<String>>, SpeakerError> {
+        let speakers: Vec<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT id, merged_into, kind FROM speakers WHERE meeting_id = ?")
+                .bind(meeting_id)
+                .fetch_all(pool)
+                .await?;
+        let links: HashMap<String, Option<String>> = speakers.iter().map(|(id, m, _)| (id.clone(), m.clone())).collect();
+        let kinds: HashMap<String, String> = speakers.into_iter().map(|(id, _, k)| (id, k)).collect();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let root = r.manual_speaker_id.clone().or_else(|| r.auto_speaker_id.clone()).map(|id| resolve_root(&links, &id))?;
+                (kinds.get(&root).map(String::as_str) == Some(KIND_PERSON)).then_some(root)
+            })
+            .collect())
+    }
+
     /// Returns the meeting's reserved "Sala" speaker, creating it when missing.
     pub async fn get_or_create_room_speaker(pool: &SqlitePool, meeting_id: &str) -> Result<Speaker, SpeakerError> {
         let mut conn = pool.acquire().await?;
@@ -752,4 +975,102 @@ mod tests {
         assert_eq!(n.len(), 1);
     }
 
+    #[tokio::test]
+    async fn create_speaker_numbering_skips_used_labels() {
+        let pool = setup().await;
+        let inputs = vec![
+            AutoSpeakerInput { transcript_id: "t1".into(), speaker_index: Some(0), ..Default::default() },
+            AutoSpeakerInput { transcript_id: "t2".into(), speaker_index: Some(2), ..Default::default() },
+        ];
+        let mut conn = pool.acquire().await.unwrap();
+        persist_auto_speakers(&mut conn, "m1", &inputs).await.unwrap(); // "Mówca 1", "Mówca 3"
+        drop(conn);
+        let s = SpeakersRepository::create_speaker(&pool, "m1", None, None).await.unwrap();
+        assert_eq!(s.label, "Mówca 4");
+    }
+
+    #[tokio::test]
+    async fn offline_pass_rewrites_only_automatic_speakers() {
+        let pool = setup().await;
+        let anna = SpeakersRepository::create_speaker(&pool, "m1", Some("Anna"), None).await.unwrap(); // Mówca 1
+        let stray = SpeakersRepository::create_speaker(&pool, "m1", None, None).await.unwrap(); // Mówca 2, unnamed
+        let piotr = SpeakersRepository::create_speaker(&pool, "m1", Some("Piotr"), None).await.unwrap(); // Mówca 3
+        for t in ["t1", "t2", "t3"] {
+            SpeakersRepository::set_auto_speaker(&pool, t, Some(&anna.id), Some(0.9)).await.unwrap();
+        }
+        SpeakersRepository::set_auto_speaker(&pool, "t4", Some(&stray.id), Some(0.6)).await.unwrap();
+        // user corrected t3 to Piotr
+        SpeakersRepository::assign_segment_speaker(&pool, "m1", &["t3".into()], Some(&piotr.id)).await.unwrap();
+
+        let assignments = vec![
+            OfflineAssignment { transcript_id: "t1".into(), target: OfflineTarget::Existing(anna.id.clone()), confidence: 0.95 },
+            OfflineAssignment { transcript_id: "t2".into(), target: OfflineTarget::New(1), confidence: 0.8 },
+            OfflineAssignment { transcript_id: "t3".into(), target: OfflineTarget::Existing(anna.id.clone()), confidence: 0.7 },
+            OfflineAssignment { transcript_id: "t4".into(), target: OfflineTarget::Room, confidence: 0.5 },
+            OfflineAssignment { transcript_id: "unknown".into(), target: OfflineTarget::Room, confidence: 0.5 },
+        ];
+        let mut existing = HashMap::new();
+        existing.insert(anna.id.clone(), vec![1.0f32, 0.0]);
+        let mut new = HashMap::new();
+        new.insert(1usize, vec![0.0f32, 1.0]);
+        let res = SpeakersRepository::apply_offline_assignments(&pool, "m1", &assignments, &existing, &new).await.unwrap();
+        assert_eq!(res.created_speakers, 1);
+        assert_eq!(res.removed_speakers, 1, "unnamed speaker with no segments is removed");
+        let mut changed = res.changed_transcript_ids.clone();
+        changed.sort();
+        assert_eq!(changed, vec!["t2".to_string(), "t4".to_string()]);
+
+        let segs = SpeakersRepository::list_segment_speakers(&pool, "m1").await.unwrap();
+        let get = |id: &str| segs.iter().find(|s| s.transcript_id == id).unwrap().clone();
+        assert_eq!(get("t1").display_name.as_deref(), Some("Anna"));
+        assert_eq!(get("t1").confidence, Some(0.95));
+        assert_eq!(get("t2").display_name.as_deref(), Some("Mówca 4"), "new speaker numbered after the highest label");
+        assert_eq!(get("t3").display_name.as_deref(), Some("Piotr"), "manual correction survives");
+        assert!(get("t3").is_manual);
+        assert_eq!(get("t4").display_name.as_deref(), Some("Sala"));
+        let auto_t3: Option<String> = sqlx::query_scalar("SELECT auto_speaker_id FROM transcripts WHERE id='t3'").fetch_one(&pool).await.unwrap();
+        assert_eq!(auto_t3.as_deref(), Some(anna.id.as_str()));
+
+        // named speaker without automatic segments (Piotr) is kept
+        let list = SpeakersRepository::list_speakers(&pool, "m1").await.unwrap();
+        assert!(list.iter().any(|s| s.id == piotr.id));
+        assert!(!list.iter().any(|s| s.id == stray.id));
+        let centroid: Option<Vec<u8>> = sqlx::query_scalar("SELECT centroid FROM speakers WHERE id = ?").bind(&anna.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(centroid.map(|c| c.len()), Some(8));
+
+        // running again with the same result changes nothing
+        let rows = SpeakersRepository::list_segments_for_diarization(&pool, "m1").await.unwrap();
+        let shown = SpeakersRepository::displayed_person_speakers(&pool, "m1", &rows).await.unwrap();
+        assert_eq!(rows.len(), 4);
+        let t4 = rows.iter().position(|r| r.id == "t4").unwrap();
+        assert_eq!(shown[t4], None, "room is not a person");
+        let t3 = rows.iter().position(|r| r.id == "t3").unwrap();
+        assert_eq!(shown[t3].as_deref(), Some(piotr.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn offline_pass_rejects_foreign_or_room_targets_and_keeps_referenced_speakers() {
+        let pool = setup().await;
+        let other = SpeakersRepository::create_speaker(&pool, "m2", None, None).await.unwrap();
+        let a = vec![OfflineAssignment { transcript_id: "t1".into(), target: OfflineTarget::Existing(other.id.clone()), confidence: 1.0 }];
+        assert!(matches!(
+            SpeakersRepository::apply_offline_assignments(&pool, "m1", &a, &HashMap::new(), &HashMap::new()).await,
+            Err(SpeakerError::WrongMeeting(_))
+        ));
+        let room = SpeakersRepository::get_or_create_room_speaker(&pool, "m1").await.unwrap();
+        let a = vec![OfflineAssignment { transcript_id: "t1".into(), target: OfflineTarget::Existing(room.id.clone()), confidence: 1.0 }];
+        assert!(matches!(
+            SpeakersRepository::apply_offline_assignments(&pool, "m1", &a, &HashMap::new(), &HashMap::new()).await,
+            Err(SpeakerError::RoomSpeaker)
+        ));
+        // an unnamed speaker referenced by the edit history must not be deleted (undo would break)
+        let x = SpeakersRepository::create_speaker(&pool, "m1", None, None).await.unwrap();
+        let y = SpeakersRepository::create_speaker(&pool, "m1", None, None).await.unwrap();
+        SpeakersRepository::assign_segment_speaker(&pool, "m1", &["t1".into()], Some(&x.id)).await.unwrap();
+        SpeakersRepository::assign_segment_speaker(&pool, "m1", &["t1".into()], Some(&y.id)).await.unwrap();
+        let res = SpeakersRepository::apply_offline_assignments(&pool, "m1", &[], &HashMap::new(), &HashMap::new()).await.unwrap();
+        assert_eq!(res.removed_speakers, 0);
+        let edits: Vec<String> = sqlx::query_scalar("SELECT id FROM speaker_edits ORDER BY edited_at DESC, rowid DESC").fetch_all(&pool).await.unwrap();
+        SpeakersRepository::undo_edit(&pool, &edits[0]).await.unwrap();
+    }
 }
